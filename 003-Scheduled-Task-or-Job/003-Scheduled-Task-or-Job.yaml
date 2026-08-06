@@ -1,0 +1,148 @@
+id: "003"
+title: Suspicious Scheduled Task Creation and Registry-Based Task Manipulation
+severity: Critical
+
+categorization:
+  tactics:
+    - Execution
+    - Persistence
+    - Privilege Escalation
+  technique_id: T1053.005
+  technique_name: "Scheduled Task/Job: Scheduled Task"
+  technique_url: https://attack.mitre.org/techniques/T1053/005/
+
+goal: >-
+  Detect scheduled tasks registered through the legitimate Task Scheduler API
+  that target a shell/interpreter or a user-writable staging path, and
+  separately detect direct registry manipulation of the Task Scheduler's
+  internal data structures used to create or hide tasks without going
+  through the official registration process.
+
+strategy_abstract: >-
+  Collect both ScheduledTaskRegistered events (legitimate task registration)
+  and registry write events (RegistryValueSet/RegistryKeySet) scoped to the
+  Task Scheduler's TaskCache registry structure. Suppress known-legitimate
+  vendor/OS tasks via name and path allowlisting. Score remaining task
+  registrations based on target path, command obfuscation, and whether the
+  registering account is a real user versus a system/service account. Score
+  registry writes under TaskCache\Tree or Security Descriptor modifications
+  under TaskCache\Tasks as high-confidence indicators of task
+  hiding/manipulation.
+
+technical_context: >-
+  Scheduled tasks are a common persistence mechanism since they survive
+  reboots/logoffs and can run as SYSTEM. Most scheduled-task activity on any
+  fleet is legitimate OS/application maintenance, so this rule separates
+  that expected noise from tasks pointing at a shell/interpreter with a
+  non-service author, and — critically — also covers a
+  registry-manipulation-based technique ("Ghost Task") that bypasses the
+  Task Scheduler service entirely and therefore never generates a
+  ScheduledTaskRegistered event, evading detections that rely solely on that
+  event type.
+
+query:
+  platform: CrowdStrike LogScale (CQL)
+  logic: |
+    // Scope to both legitimate task registration events and direct registry writes (covers Atomic #2 via the API, and Atomic #10 which bypasses it)
+    #event_simpleName=/^(ScheduledTaskRegistered|RegistryValueSet|RegistryKeySet)$/
+    // Lowercase the task name for case-insensitive matching later
+    | TaskNameLower := lower(TaskName)
+    // Lowercase the task's configured target command for case-insensitive matching later
+    | TaskExecLower := lower(TaskExecCommand)
+    // Lowercase the registering author/account for case-insensitive matching later
+    | TaskAuthorLower := lower(TaskAuthor)
+    // Lowercase the registry path (only populated on registry events) for case-insensitive matching later
+    | RegistryPathLower := lower(RegistryPath)
+    // Lowercase the registry value name (only populated on registry events) for case-insensitive matching later
+    | RegistryValueNameLower := lower(RegistryValueName)
+
+    // Step 1: identify tasks belonging to known-legitimate vendors/OS components, so they can be suppressed later
+    | case {
+        // Task name mentions a recognized vendor/product, matched anywhere in the string
+        TaskNameLower=/.*(windows defender|onedrive|edgeupdate|edge update|google update|adobe|nvidia|dropbox|zoom|microsoft office).*/ | _KnownVendor := "true" ;
+        // Task's target executable lives under Program Files
+        TaskExecLower=/.*\\program files\\.*/                                                                                          | _KnownVendor := "true" ;
+        // Task's target executable lives under Program Files (x86)
+        TaskExecLower=/.*\\program files \(x86\)\\.*/                                                                                  | _KnownVendor := "true" ;
+        // Task's target executable is the legitimate Windows Defender platform binary path
+        TaskExecLower=/.*\\programdata\\microsoft\\windows defender\\.*/                                                               | _KnownVendor := "true" ;
+        // Default: not a recognized vendor/OS task
+        * | _KnownVendor := "false" ;
+    }
+
+    // Step 2: identify whether the task was registered by a service/system account (normal for OS maintenance) vs. a real user
+    | case {
+        // Blank author field is typical of background service-registered tasks
+        TaskAuthorLower=""                                                              | _ServiceAuthor := "true" ;
+        // Author is one of Windows' built-in service-level accounts
+        TaskAuthorLower=/(?i)(system|trustedinstaller|local service|network service)$/  | _ServiceAuthor := "true" ;
+        // Default: registered by an actual named user account
+        * | _ServiceAuthor := "false" ;
+    }
+
+    // Step 3: assign a risk level based on event type, vendor status, target path, and registering author
+    | case {
+        // Known-vendor task registrations are suppressed regardless of what they launch
+        #event_simpleName="ScheduledTaskRegistered" AND _KnownVendor="true"
+            | _Risk := "Low" ;
+
+        // Task points into a user-writable/staging directory - strong indicator regardless of authorship
+        #event_simpleName="ScheduledTaskRegistered" AND TaskExecLower=/.*\\(temp|appdata\\local\\temp|users\\public|downloads)\\.*/
+            | _Risk := "Critical" ;
+
+        // Task's command contains obfuscation, hidden-window, or download flags
+        #event_simpleName="ScheduledTaskRegistered" AND TaskExecCommand=/(?i)(-enc\b|-encodedcommand|-windowstyle\s+hidden|-nop\b|iex\s|invoke-expression|downloadstring|downloadfile)/
+            | _Risk := "Critical" ;
+
+        // Task targets a shell/interpreter AND was registered by a real user, not a service account - matches Atomic Test #2's pattern
+        #event_simpleName="ScheduledTaskRegistered" AND TaskExecLower=/.*(cmd\.exe|powershell\.exe|wscript\.exe|cscript\.exe|mshta\.exe|rundll32\.exe)$/ AND _ServiceAuthor="false"
+            | _Risk := "High" ;
+
+        // Task targets a shell/interpreter but was registered by a service/system account - lower confidence, kept for visibility
+        #event_simpleName="ScheduledTaskRegistered" AND TaskExecLower=/.*(cmd\.exe|powershell\.exe|wscript\.exe|cscript\.exe|mshta\.exe|rundll32\.exe)$/
+            | _Risk := "Medium" ;
+
+        // Direct registry write under the Task Scheduler's internal Tree structure - matches Atomic Test #10's Ghost Task technique, bypassing the official registration API
+        #event_simpleName=/^(RegistryValueSet|RegistryKeySet)$/ AND RegistryPathLower=/.*\\schedule\\taskcache\\tree\\.*/
+            | _Risk := "Critical" ;
+
+        // Security Descriptor (SD) value modified under TaskCache\Tasks - the "hide an existing task" trick (as used by Tarrask-style malware)
+        #event_simpleName="RegistryValueSet" AND RegistryPathLower=/.*\\schedule\\taskcache\\tasks\\.*/ AND RegistryValueNameLower="sd"
+            | _Risk := "Critical" ;
+
+        // Default: nothing suspicious matched
+        * | _Risk := "Low" ;
+    }
+    // Keep only rows that matched a suspicious branch
+    | _Risk!="Low"
+    // Output the columns needed for triage, including both task-registration and registry-specific fields; limit raised above the 200-row default
+    | table([timestamp, ComputerName, UserName, TaskName, TaskAuthor, TaskExecCommand, RegistryPath, RegistryValueName, _KnownVendor, _ServiceAuthor, _Risk], limit=20000)
+
+blind_spots_and_assumptions:
+  - Assumes RegistryValueSet/RegistryKeySet and the fields RegistryPath/RegistryValueName are the correct event/field names in the deployed Falcon sensor schema — this should be validated in your environment before relying on the registry-based branches.
+  - The registry branches do not filter by the writing process, so legitimate Task Scheduler service activity (svchost.exe managing normal tasks) will also write to TaskCache\Tree and may appear alongside genuine hits if the telemetry doesn't distinguish writer context.
+  - A task registered under a spoofed vendor-sounding name/path not present in the current allowlist will not be suppressed, and conversely, a real attacker registering a task under an actual allowlisted vendor path would bypass detection.
+
+false_positives:
+  - IT deployment tooling (SCCM, PDQ Deploy, similar) may legitimately create tasks targeting cmd.exe/powershell.exe — maintain an allow-list of known deployment service accounts.
+  - Software installers frequently create-then-remove one-time scheduled tasks as part of normal setup.
+  - The registry-write branches may generate noise from legitimate Task Scheduler service operations if writer-process context isn't available in your telemetry.
+
+priority:
+  - level: Critical
+    description: suspicious target path, obfuscated command, or either registry-manipulation branch.
+  - level: High
+    description: shell-targeting task registered by a non-service author.
+  - level: Medium
+    description: shell-targeting task registered by a service/system author.
+
+validation:
+  - >-
+    Validated against Atomic Red Team T1053.005 Atomic Test #2 (Scheduled
+    task Local) and Atomic Test #10 (Scheduled Task "Ghost Task" via
+    Registry Key Manipulation).
+
+response:
+  - Retrieve the full task definition (trigger, action, run-as account) via "schtasks /query /tn <name> /xml" or the Task Scheduler operational event log.
+  - For registry-based hits, check Task Scheduler operational log entries (Event ID 106/140/141/200/201) to reconstruct what the task executed, since it may not appear in schtasks /query output at all.
+  - Correlate with "001 - Masquerading" and "002 - Command and Scripting Interpreter" for the same host/user/time window.
